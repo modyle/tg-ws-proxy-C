@@ -13,19 +13,18 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    # 2. Конфигурируем CMake и принудительно задаем VCPKG_ROOT для проверки в CMakeLists.txt
+    # 2. Конфигурируем CMake
+    # Все параметры в одну строку. Тулчейн vcpkg подгрузит манифест vcpkg.json и соберет deps.
     - name: Configure CMake
-      env:
-        VCPKG_ROOT: C:\vcpkg
       run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static
 
     # 3. Собираем проект в режиме Release
     - name: Build Project
       run: cmake --build build --config Release
 
-    # 4. Выкладываем готовый монолитный .exe в артефакты
+    # 4. Выкладываем готовый монолитный .exe в артефакты GitHub
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: tg-ws-proxy-windows-x64
-        path: build/Release/tg-ws-proxy-C.exe
+        path: build/bin/Release/tg_bridge.exe
