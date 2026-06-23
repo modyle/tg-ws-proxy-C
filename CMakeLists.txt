@@ -90,13 +90,18 @@ target_include_directories(tg_bridge PRIVATE
 )
 
 # ==============================================================================
-# 7. КОНТРОЛЬ КАЧЕСТВА КОДА
+# 7. КОНТРОЛЬ КАЧЕСТВА КОДА И ПОДАВЛЕНИЕ ВОРНИНГОВ СОВМЕСТИМОСТИ
 # ==============================================================================
 if(MSVC)
     target_compile_options(tg_bridge PRIVATE 
         /W4
         /WX
-        /wd4100
+        /wd4100 # Игнорировать неиспользуемые аргументы функций
+    )
+    # Подавляем ворнинги MSVC о "небезопасных" функциях и депрекациях OpenSSL 3.0
+    target_compile_definitions(tg_bridge PRIVATE 
+        _CRT_SECURE_NO_WARNINGS
+        OPENSSL_SUPPRESS_DEPRECATED
     )
 else()
     target_compile_options(tg_bridge PRIVATE 

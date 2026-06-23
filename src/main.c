@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include <time.h>
+#include <openssl/rand.h>
 
 #ifdef _WIN32
 #include <windows.h>
