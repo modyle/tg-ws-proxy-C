@@ -13,8 +13,10 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    # 2. Конфигурируем CMake (в одну строку, чтобы избежать проблем с парсингом YAML)
+    # 2. Конфигурируем CMake и принудительно задаем VCPKG_ROOT для проверки в CMakeLists.txt
     - name: Configure CMake
+      env:
+        VCPKG_ROOT: C:\vcpkg
       run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-windows-static
 
     # 3. Собираем проект в режиме Release
