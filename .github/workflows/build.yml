@@ -6,7 +6,6 @@ on:
 
 jobs:
   build:
-    # Запускаем на сервере Windows Server от GitHub
     runs-on: windows-latest
 
     steps:
@@ -14,13 +13,9 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    # 2. Устанавливаем статический OpenSSL через vcpkg
-    # x64-windows-static собирает полностью независимые .lib файлы
-    - name: Install OpenSSL (Static)
-      run: |
-        vcpkg install openssl:x64-windows-static
-
-    # 3. Конфигурируем CMake, указывая путь к установленным пакетам vcpkg
+    # 2. Конфигурируем CMake
+    # Шаг vcpkg install убран. CMake сам запустит vcpkg в режиме манифеста 
+    # и установит openssl и libwebsockets благодаря флагу -DVCPKG_TARGET_TRIPLET
     - name: Configure CMake
       run: |
         cmake -B build `
@@ -28,14 +23,13 @@ jobs:
           -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
           -DVCPKG_TARGET_TRIPLET=x64-windows-static
 
-    # 4. Собираем проект в режиме Release
+    # 3. Собираем проект в режиме Release
     - name: Build Project
       run: cmake --build build --config Release
 
-    # 5. Выкладываем готовый монолитный .exe в артефакты
+    # 4. Выкладываем готовый монолитный .exe в артефакты
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
         name: tg-ws-proxy-windows-x64
-        # Путь к скомпилированному файлу (зависит от имени в CMakeLists.txt)
         path: build/Release/tg-ws-proxy-C.exe
