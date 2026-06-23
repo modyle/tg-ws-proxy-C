@@ -1,0 +1,8 @@
+{
+  "name": "tg-ws-proxy-c",
+  "version": "1.0.0",
+  "dependencies": [
+    "openssl",
+    "libwebsockets"
+  ]
+}

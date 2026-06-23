@@ -1,44 +1,80 @@
 cmake_minimum_required(VERSION 3.15)
-set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-# Форсируем статический рантайм /MT для всего проекта
-set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+# ==============================================================================
+# 1. АВТОМАТИЧЕСКИЙ ПОИСК И ПРОВЕРКА VCPKG (ДО project())
+# ==============================================================================
+# Если переменная CMAKE_TOOLCHAIN_FILE не была передана вручную,
+# попробуем автоматически подтянуть vcpkg из переменной окружения VCPKG_ROOT
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE AND DEFINED ENV{VCPKG_ROOT})
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "")
+endif()
 
-project(tg_c_bridge C)
+# Оценка подключения vcpkg. Если его нет — прерываемся с понятной ошибкой.
+# Переменная VCPKG_TOOLCHAIN автоматически выставляется в 1 самим vcpkg при успешном подключении.
+if(NOT VCPKG_TOOLCHAIN)
+    message(FATAL_ERROR 
+        "\n======================================================================\n"
+        "[FATAL ERROR] vcpkg is not detected! This project requires vcpkg.\n"
+        "======================================================================\n"
+        "Please follow these steps to build the project:\n"
+        "1. Install vcpkg (https://github.com/microsoft/vcpkg)\n"
+        "2. Define the VCPKG_ROOT environment variable pointing to your vcpkg folder\n"
+        "   OR configure CMake manually by passing the toolchain file:\n\n"
+        "   cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=<path_to_vcpkg>/scripts/buildsystems/vcpkg.cmake\n"
+        "======================================================================\n"
+    )
+endif()
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
+# ==============================================================================
+# 2. ПОЛИТИКИ CMAKE
+# ==============================================================================
+cmake_policy(SET CMP0048 NEW) # Позволяет использовать project(VERSION)
+cmake_policy(SET CMP0091 NEW) # Позволяет настраивать рантайм MSVC через CMAKE_MSVC_RUNTIME_LIBRARY
+
+# Настройка триплета vcpkg для статической сборки Windows
+if(WIN32)
+    set(VCPKG_TARGET_TRIPLET "x64-windows-static" CACHE STRING "vcpkg target triplet")
+endif()
+
+# ==============================================================================
+# 3. ОПРЕДЕЛЕНИЕ ПРОЕКТА
+# ==============================================================================
+project(tg_c_bridge 
+    VERSION 1.0.0
+    LANGUAGES C
+)
+
+# Экспорт compile_commands.json для корректной работы LSP/clangd
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-cmake_policy(SET CMP0048 NEW)
-cmake_policy(SET CMP0091 NEW)
+# Настройка статического рантайма для MSVC (/MT или /MTd)
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
-include(FetchContent)
+# Поиск статических библиотек OpenSSL
+set(OPENSSL_USE_STATIC_LIBS TRUE)
+set(LinkAsStatic TRUE) 
 
-# 1. Настройки OpenSSL для libwebsockets (Прямые пути к MT)
-set(LWS_WITH_OPENSSL ON CACHE BOOL "" FORCE)
-set(LWS_WITH_GNUTLS OFF CACHE BOOL "" FORCE)
-set(LWS_OPENSSL_INCLUDE_DIRS "C:/Program Files/OpenSSL-Win64/include" CACHE STRING "" FORCE)
-set(LWS_OPENSSL_LIBRARIES "C:/Program Files/OpenSSL-Win64/lib/VC/x64/MT/libssl.lib;C:/Program Files/OpenSSL-Win64/lib/VC/x64/MT/libcrypto.lib" CACHE STRING "" FORCE)
+# ==============================================================================
+# 4. ОРГАНИЗАЦИЯ КАТАЛОГОВ ВЫВОДА
+# ==============================================================================
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-# 2. Оптимизируем настройки libwebsockets, убирая ломающиеся на Windows модули
-set(LWS_WITH_MINIMAL_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(LWS_WITHOUT_TESTAPPS ON CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(LWS_WITH_SHARED OFF CACHE BOOL "" FORCE)
-set(LWS_WITH_STATIC ON CACHE BOOL "" FORCE)
-set(LWS_WITH_DIR OFF CACHE BOOL "" FORCE) # Выключаем багнутый module, который требовал 'vpt'
+# ==============================================================================
+# 5. ПОИСК ЗАВИСИМОСТЕЙ (vcpkg автоматически скачает их перед этим шагом)
+# ==============================================================================
+find_package(OpenSSL REQUIRED)
+find_package(libwebsockets CONFIG REQUIRED)
 
-# Возвращаем стабильный релизный тег v4.3.3
-FetchContent_Declare(
-    libwebsockets
-    GIT_REPOSITORY https://github.com/warmcat/libwebsockets.git
-    GIT_TAG         v4.3.3
-)
-FetchContent_MakeAvailable(libwebsockets)
+# ==============================================================================
+# 6. ОБЪЯВЛЕНИЕ ЦЕЛИ (TARGET)
+# ==============================================================================
+add_executable(tg_bridge)
 
-# Наш исполняемый файл
-add_executable(tg_bridge
+target_sources(tg_bridge PRIVATE
     src/main.c
     src/mtproto.c
     src/mtproto_transport.c
@@ -47,28 +83,57 @@ add_executable(tg_bridge
     src/mem.c
 )
 
-# Указываем CMake, что наш таргет зависит от сборки библиотеки
-add_dependencies(tg_bridge websockets)
+target_compile_features(tg_bridge PRIVATE c_std_11)
 
-# Пути для поиска заголовочных файлов (.h)
 target_include_directories(tg_bridge PRIVATE 
-    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    "C:/Program Files/OpenSSL-Win64/include"
-    "${libwebsockets_SOURCE_DIR}/include"
-    "${libwebsockets_BINARY_DIR}"
 )
 
-# Линкуем библиотеки (.lib) — исправили websockets_static на websockets
+# ==============================================================================
+# 7. КОНТРОЛЬ КАЧЕСТВА КОДА
+# ==============================================================================
+if(MSVC)
+    target_compile_options(tg_bridge PRIVATE 
+        /W4
+        /WX
+        /wd4100
+    )
+else()
+    target_compile_options(tg_bridge PRIVATE 
+        -Wall 
+        -Wextra 
+        -Wpedantic 
+        -Werror
+        -Wno-unused-parameter
+    )
+endif()
+
+# ==============================================================================
+# 8. ЛИНКОВКА БИБЛИОТЕК
+# ==============================================================================
 target_link_libraries(tg_bridge PRIVATE 
+    OpenSSL::SSL
+    OpenSSL::Crypto
     websockets
-    "C:/Program Files/OpenSSL-Win64/lib/VC/x64/MT/libssl_static.lib"
-    "C:/Program Files/OpenSSL-Win64/lib/VC/x64/MT/libcrypto_static.lib"
 )
 
 if(WIN32)
-    target_link_libraries(tg_bridge PRIVATE ws2_32 userenv bcrypt crypt32 iphlpapi)
+    target_link_libraries(tg_bridge PRIVATE 
+        ws2_32 
+        userenv 
+        bcrypt 
+        crypt32 
+        iphlpapi
+    )
     if(MSVC)
         target_link_options(tg_bridge PRIVATE "/SUBSYSTEM:CONSOLE")
     endif()
 endif()
+
+# ==============================================================================
+# 9. ПРАВИЛА УСТАНОВКИ
+# ==============================================================================
+include(GNUInstallDirs)
+install(TARGETS tg_bridge
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)

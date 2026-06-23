@@ -25,41 +25,19 @@ static const char *dc_hosts[] = {
     "kws5.web.telegram.org"
 };
 
-// Глобальный счетчик ОЗУ для буферов полезной нагрузки
-static size_t g_payload_bytes = 0;
+struct dc_ip_map {
+    int dc;
+    const char *ip;
+};
 
-// Безопасное добавление в буфер с проверкой лимита ОЗУ
-static int buf_append(uint8_t **data, size_t *len, size_t *cap, const uint8_t *new_data, size_t new_len) {
-    if (new_len == 0) return 0;
-    if (*len + new_len > *cap) {
-        size_t new_cap = *cap == 0 ? 4096 : *cap * 2;
-        while (new_cap < *len + new_len) new_cap *= 2;
-        
-        if (g_payload_bytes + (new_cap - *cap) > MAX_GLOBAL_PAYLOAD) {
-            lwsl_err("[OOM] Достигнут лимит 3MB. Пакет отброшен.\n");
-            return -1;
-        }
-        
-        uint8_t *new_buf = realloc(*data, LWS_PRE + new_cap);
-        if (!new_buf) return -1;
-        *data = new_buf;
-        g_payload_bytes += (new_cap - *cap);
-        *cap = new_cap;
-    }
-    memcpy(*data + LWS_PRE + *len, new_data, new_len);
-    *len += new_len;
-    return 0;
-}
-
-static void buf_free(uint8_t **data, size_t *cap, size_t *len) {
-    if (*data) {
-        free(*data);
-        g_payload_bytes -= *cap;
-        *data = NULL;
-    }
-    *cap = 0;
-    *len = 0;
-}
+static struct dc_ip_map dc_ips[] = {
+    { 1, "149.154.175.50" },
+    { 2, "149.154.167.50" },
+    { 3, "149.154.175.100" },
+    { 4, "149.154.167.91" },
+    { 5, "91.108.56.100" },
+    { 203, "91.105.192.100" }
+};
 
 static void get_log_filename(char *buffer, size_t size) {
     time_t rawtime;
@@ -71,6 +49,9 @@ static void get_log_filename(char *buffer, size_t size) {
 
 static void custom_lws_log(int level, const char *line) {
     (void)level;
+    if (strstr(line, "Missing URI in HTTP request") != NULL) {
+        return;
+    }
     printf("%s", line);
     if (global_log_file) {
         fprintf(global_log_file, "%s", line);
@@ -109,7 +90,6 @@ static void load_config(const char *filename) {
     fclose(file);
 }
 
-// Исправлено: принимаем прямой одинарный указатель на контекст
 static int aes256_ctr_init(EVP_CIPHER_CTX *ctx, const uint8_t key[32], const uint8_t iv[16], int enc) {
     uint8_t zero[64] = {0};
     int out_len = 0;
@@ -149,7 +129,6 @@ static int wss_crypto_init(wss_crypto_context *ctx, const uint8_t relay_init[64]
     memcpy(dec_key, rev, 32);
     memcpy(dec_iv, rev + 32, 16);
 
-    // Исправлено: передаем контексты напрямую без лишнего разыменования
     if (aes256_ctr_init(ctx->encrypt_ctx, enc_key, enc_iv, 1) < 0 ||
         aes256_ctr_init(ctx->decrypt_ctx, dec_key, dec_iv, 0) < 0) {
         return -1;
@@ -196,43 +175,57 @@ static int generate_relay_init(uint8_t out[64], uint32_t proto_tag, int dc_idx) 
     return 0;
 }
 
-static int start_remote_wss(struct bridge_session *session, int route_id, uint32_t proto_tag, int dc_idx) {
+static int start_remote_connection(struct bridge_session *session, int route_id, uint32_t proto_tag, int dc_idx) {
     if (!session || !session->wsi_local_tcp) return -1;
 
-    int host_idx = abs(route_id);
-    if (host_idx == 203) host_idx = 2; 
-
-    // Защита границ массива dc_hosts (всего 5 ДЦ)
-    if (host_idx < 1 || host_idx > 5) {
-        lwsl_err("[WSS_CONNECT_ERR] Некорректный номер DC: %d\n", route_id);
-        return -1;
-    }
+    struct lws_client_connect_info ccinfo;
+    memset(&ccinfo, 0, sizeof(ccinfo));
+    ccinfo.context = lws_get_context(session->wsi_local_tcp);
 
     uint8_t relay_init[64];
     if (generate_relay_init(relay_init, proto_tag, dc_idx) < 0 || wss_crypto_init(&session->wss_crypto, relay_init) < 0) {
         return -1;
     }
 
-    struct lws_client_connect_info ccinfo;
-    memset(&ccinfo, 0, sizeof(ccinfo));
-    ccinfo.context = lws_get_context(session->wsi_local_tcp);
+    if (session->is_passthrough) {
+        const char *target_ip = "149.154.167.50"; 
+        for (size_t i = 0; i < sizeof(dc_ips)/sizeof(dc_ips[0]); i++) {
+            if (dc_ips[i].dc == abs(dc_idx)) {
+                target_ip = dc_ips[i].ip;
+                break;
+            }
+        }
+        ccinfo.address = target_ip;
+        ccinfo.port = 443;
+        ccinfo.path = NULL; 
+        ccinfo.ssl_connection = 0; 
+        ccinfo.protocol = NULL;
+        ccinfo.local_protocol_name = "binary"; 
+        ccinfo.origin = NULL;
+        ccinfo.host = target_ip;
+        ccinfo.method = "RAW"; 
 
-    // Исправлено: Позволяем LWS резолвить правильный IP для каждого домена самостоятельно!
-    ccinfo.address = dc_hosts[host_idx - 1];
-    ccinfo.port = 443;
-    ccinfo.path = "/apiws";
-    ccinfo.host = dc_hosts[host_idx - 1]; 
-    
-    // Исправлено: Буфер на стеке БЕЗ ключевого слова static
-    char origin_buf[512];
-    snprintf(origin_buf, sizeof(origin_buf), "https://%s", ccinfo.host);
-    ccinfo.origin = origin_buf;
+        lwsl_user("[PASSTHROUGH] Трафик для DC %d -> Направление TCP: %s:443\n", dc_idx, target_ip);
+    } else {
+        int host_idx = abs(route_id);
+        if (host_idx < 1 || host_idx > 5) return -1;
 
-    ccinfo.ssl_connection = LCCSCF_USE_SSL | LCCSCF_ALLOW_SELFSIGNED | LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
-    ccinfo.protocol = "binary";
-    ccinfo.userdata = NULL;
+        ccinfo.address = dc_hosts[host_idx - 1];
+        ccinfo.port = 443;
+        ccinfo.path = "/apiws";
+        ccinfo.host = dc_hosts[host_idx - 1]; 
+        
+        char origin_buf[512];
+        snprintf(origin_buf, sizeof(origin_buf), "https://%s", ccinfo.host);
+        ccinfo.origin = origin_buf;
 
-    lwsl_user("[WSS_CONNECT] Трафик для DC %d -> Направление: %s\n", dc_idx, ccinfo.host);
+        ccinfo.ssl_connection = LCCSCF_USE_SSL | LCCSCF_ALLOW_SELFSIGNED | LCCSCF_SKIP_SERVER_CERT_HOSTNAME_CHECK;
+        ccinfo.protocol = "binary";
+        ccinfo.userdata = NULL;
+
+        lwsl_user("[WSS_CONNECT] Трафик для DC %d -> Направление WSS: %s\n", dc_idx, ccinfo.host);
+    }
+
     session->wsi_remote_ws = lws_client_connect_via_info(&ccinfo);
     if (!session->wsi_remote_ws) return -1;
     
@@ -242,7 +235,10 @@ static int start_remote_wss(struct bridge_session *session, int route_id, uint32
 
 int callback_remote_wss(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
     struct bridge_session *session = (struct bridge_session *)lws_get_opaque_user_data(wsi);
-    if (!session && reason != LWS_CALLBACK_CLIENT_CLOSED && reason != LWS_CALLBACK_CLIENT_CONNECTION_ERROR) return 0;
+    if (!session && 
+        reason != LWS_CALLBACK_CLIENT_CLOSED && 
+        reason != LWS_CALLBACK_CLIENT_CONNECTION_ERROR &&
+        reason != LWS_CALLBACK_RAW_CLOSE) return 0;
 
     switch (reason) {
         case LWS_CALLBACK_CLIENT_APPEND_HANDSHAKE_HEADER: {
@@ -250,60 +246,97 @@ int callback_remote_wss(struct lws *wsi, enum lws_callback_reasons reason, void 
             if (lws_add_http_header_by_token(wsi, WSI_TOKEN_PROTOCOL, (unsigned char *)"binary", 6, p, end)) return -1;
             break;
         }
+        case LWS_CALLBACK_RAW_CONNECTED:
         case LWS_CALLBACK_CLIENT_ESTABLISHED:
             session->connection_established = 1;
-            lwsl_user("[WSS] Подключено к Telegram.\n");
+            lwsl_user("[%s] Подключено к Telegram.\n", session->is_passthrough ? "RAW" : "WSS");
             lws_callback_on_writable(wsi);
-            break;
-        case LWS_CALLBACK_CLIENT_RECEIVE: {
-            if (buf_append(&session->ws_to_tcp_buf, &session->ws_to_tcp_len, &session->ws_to_tcp_cap, in, len) < 0) {
-                return -1;
+            if (session->rx_paused_tcp && session->wsi_local_tcp) {
+                session->rx_paused_tcp = 0;
+                lws_rx_flow_control(session->wsi_local_tcp, 1);
             }
-            
-            uint8_t *target = session->ws_to_tcp_buf + LWS_PRE + session->ws_to_tcp_len - len;
-            int out_len = 0;
-            EVP_DecryptUpdate(session->wss_crypto.decrypt_ctx, target, &out_len, target, (int)len);
-            EVP_EncryptUpdate(session->crypto.encrypt_ctx, target, &out_len, target, (int)len);
+            break;
+        case LWS_CALLBACK_RAW_RX:
+        case LWS_CALLBACK_CLIENT_RECEIVE: {
+            uint8_t *in_data = (uint8_t *)in;
+            size_t in_len = len;
 
-            if (session->ws_to_tcp_len > SESSION_BUFFER_LIMIT) {
+            size_t free_space = BUFFER_SIZE - session->ws_to_tcp_len;
+            if (in_len > free_space) {
+                in_len = free_space; 
+            }
+
+            if (in_len > 0) {
+                uint8_t *target = session->ws_to_tcp_raw + LWS_PRE + session->ws_to_tcp_len;
+                memcpy(target, in_data, in_len);
+                session->ws_to_tcp_len += in_len;
+
+                // Перешифрование требуется всегда!
+                int out_len = 0;
+                EVP_DecryptUpdate(session->wss_crypto.decrypt_ctx, target, &out_len, target, (int)in_len);
+                EVP_EncryptUpdate(session->crypto.encrypt_ctx, target, &out_len, target, (int)in_len);
+            }
+
+            if (session->wsi_local_tcp && session->ws_to_tcp_len > 0) {
+                lws_callback_on_writable(session->wsi_local_tcp);
+            }
+
+            if (session->ws_to_tcp_len >= (100 * 1024) && !session->rx_paused_ws) {
                 session->rx_paused_ws = 1;
                 lws_rx_flow_control(wsi, 0);
             }
-            if (session->wsi_local_tcp) lws_callback_on_writable(session->wsi_local_tcp);
             break;
         }
+        case LWS_CALLBACK_RAW_WRITEABLE:
         case LWS_CALLBACK_CLIENT_WRITEABLE:
             if (!session->wss_crypto.relay_init_sent) {
                 uint8_t temp[LWS_PRE + 64];
                 memcpy(temp + LWS_PRE, session->wss_crypto.relay_init, 64);
-                if (lws_write(wsi, temp + LWS_PRE, 64, lws_write_ws_flags(LWS_WRITE_BINARY, 1, 1)) < 64) return -1;
+                
+                int written;
+                if (session->is_passthrough) {
+                    written = lws_write(wsi, temp + LWS_PRE, 64, LWS_WRITE_RAW);
+                } else {
+                    written = lws_write(wsi, temp + LWS_PRE, 64, lws_write_ws_flags(LWS_WRITE_BINARY, 1, 1));
+                }
+                if (written < 64) return -1;
                 session->wss_crypto.relay_init_sent = 1;
+
+                lws_callback_on_writable(wsi);
+                break;
             }
             
             if (session->tcp_to_ws_len > 0) {
-                int written = lws_write(wsi, session->tcp_to_ws_buf + LWS_PRE, session->tcp_to_ws_len, lws_write_ws_flags(LWS_WRITE_BINARY, 1, 1));
+                int written;
+                if (session->is_passthrough) {
+                    written = lws_write(wsi, session->tcp_to_ws_raw + LWS_PRE, session->tcp_to_ws_len, LWS_WRITE_RAW);
+                } else {
+                    written = lws_write(wsi, session->tcp_to_ws_raw + LWS_PRE, session->tcp_to_ws_len, lws_write_ws_flags(LWS_WRITE_BINARY, 1, 1));
+                }
+
                 if (written < 0) return -1;
                 if ((size_t)written < session->tcp_to_ws_len) {
-                    memmove(session->tcp_to_ws_buf + LWS_PRE, session->tcp_to_ws_buf + LWS_PRE + written, session->tcp_to_ws_len - written);
+                    memmove(session->tcp_to_ws_raw + LWS_PRE, session->tcp_to_ws_raw + LWS_PRE + written, session->tcp_to_ws_len - written);
                     session->tcp_to_ws_len -= written;
-                    lws_callback_on_writable(wsi);
+                    lws_callback_on_writable(wsi); 
                 } else {
                     session->tcp_to_ws_len = 0;
                 }
             }
             
-            if (session->tcp_to_ws_len < SESSION_BUFFER_LIMIT / 2 && session->rx_paused_tcp && session->wsi_local_tcp) {
+            if (session->tcp_to_ws_len < (32 * 1024) && session->rx_paused_tcp && session->wsi_local_tcp) {
                 session->rx_paused_tcp = 0;
                 lws_rx_flow_control(session->wsi_local_tcp, 1);
             }
             break;
         case LWS_CALLBACK_CLIENT_CLOSED:
+        case LWS_CALLBACK_RAW_CLOSE:
         case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
             if (session) {
                 session->wsi_remote_ws = NULL;
                 session->connection_established = 0;
-                buf_free(&session->tcp_to_ws_buf, &session->tcp_to_ws_cap, &session->tcp_to_ws_len);
-                buf_free(&session->ws_to_tcp_buf, &session->ws_to_tcp_cap, &session->ws_to_tcp_len);
+                session->tcp_to_ws_len = 0;
+                session->ws_to_tcp_len = 0;
                 wss_crypto_free(&session->wss_crypto);
                 if (session->wsi_local_tcp) lws_set_timeout(session->wsi_local_tcp, 1, LWS_TO_KILL_ASYNC);
             }
@@ -334,51 +367,69 @@ int callback_local_tcp(struct lws *wsi, enum lws_callback_reasons reason, void *
                 if (res == 0) return 0;
 
                 int route_id = abs(dc_idx);
-                if (start_remote_wss(session, route_id, proto_tag, dc_idx) < 0) return -1;
+                
+                if (dc_idx < 0 || route_id == 203 || route_id == 1 || route_id == 3 || route_id == 5) {
+                    session->is_passthrough = 1;
+                } else {
+                    session->is_passthrough = 0;
+                }
+
+                // Исходную преамбулу клиента не сохраняем, так как вместо неё шлем relay_init
+                session->tcp_to_ws_len = 0;
+
+                if (start_remote_connection(session, route_id, proto_tag, dc_idx) < 0) return -1;
 
                 in_data += consumed;
                 in_len -= consumed;
 
                 if (!session->connection_established) {
                     session->rx_paused_tcp = 1;
-                    lws_rx_flow_control(wsi, 0);
+                    lws_rx_flow_control(wsi, 0); 
                 }
             }
 
             if (in_len == 0) break;
 
-            if (buf_append(&session->tcp_to_ws_buf, &session->tcp_to_ws_len, &session->tcp_to_ws_cap, in_data, in_len) < 0) {
-                return -1;
+            size_t free_space = BUFFER_SIZE - session->tcp_to_ws_len;
+            if (in_len > free_space) {
+                in_len = free_space; 
             }
 
-            uint8_t *target = session->tcp_to_ws_buf + LWS_PRE + session->tcp_to_ws_len - in_len;
-            int out_len = 0;
-            EVP_DecryptUpdate(session->crypto.decrypt_ctx, target, &out_len, target, (int)in_len);
-            EVP_EncryptUpdate(session->wss_crypto.encrypt_ctx, target, &out_len, target, (int)in_len);
+            if (in_len > 0) {
+                uint8_t *target = session->tcp_to_ws_raw + LWS_PRE + session->tcp_to_ws_len;
+                memcpy(target, in_data, in_len);
+                session->tcp_to_ws_len += in_len;
 
-            if (session->tcp_to_ws_len > SESSION_BUFFER_LIMIT) {
+                // Перешифрование трафика выполняется всегда
+                int out_len = 0;
+                EVP_DecryptUpdate(session->crypto.decrypt_ctx, target, &out_len, target, (int)in_len);
+                EVP_EncryptUpdate(session->wss_crypto.encrypt_ctx, target, &out_len, target, (int)in_len);
+            }
+
+            if (session->connection_established && session->wsi_remote_ws && session->tcp_to_ws_len > 0) {
+                lws_callback_on_writable(session->wsi_remote_ws);
+            }
+
+            if (session->tcp_to_ws_len >= (100 * 1024) && !session->rx_paused_tcp) {
                 session->rx_paused_tcp = 1;
                 lws_rx_flow_control(wsi, 0);
-            }
-            if (session->connection_established && session->wsi_remote_ws) {
-                lws_callback_on_writable(session->wsi_remote_ws);
             }
             break;
         }
         case LWS_CALLBACK_RAW_WRITEABLE:
             if (session->ws_to_tcp_len > 0) {
-                int written = lws_write(wsi, session->ws_to_tcp_buf + LWS_PRE, session->ws_to_tcp_len, LWS_WRITE_RAW);
+                int written = lws_write(wsi, session->ws_to_tcp_raw + LWS_PRE, session->ws_to_tcp_len, LWS_WRITE_RAW);
                 if (written < 0) return -1;
                 if ((size_t)written < session->ws_to_tcp_len) {
-                    memmove(session->ws_to_tcp_buf + LWS_PRE, session->ws_to_tcp_buf + LWS_PRE + written, session->ws_to_tcp_len - written);
+                    memmove(session->ws_to_tcp_raw + LWS_PRE, session->ws_to_tcp_raw + LWS_PRE + written, session->ws_to_tcp_len - written);
                     session->ws_to_tcp_len -= written;
-                    // Исправлено: не форсируем lws_callback_on_writable здесь во избежание 100% загрузки CPU
+                    lws_callback_on_writable(wsi); 
                 } else {
                     session->ws_to_tcp_len = 0;
                 }
             }
 
-            if (session->ws_to_tcp_len < SESSION_BUFFER_LIMIT / 2 && session->rx_paused_ws && session->wsi_remote_ws) {
+            if (session->ws_to_tcp_len < (32 * 1024) && session->rx_paused_ws && session->wsi_remote_ws) {
                 session->rx_paused_ws = 0;
                 lws_rx_flow_control(session->wsi_remote_ws, 1);
             }
@@ -390,8 +441,6 @@ int callback_local_tcp(struct lws *wsi, enum lws_callback_reasons reason, void *
             }
             mtproto_free(&session->crypto);
             wss_crypto_free(&session->wss_crypto);
-            buf_free(&session->tcp_to_ws_buf, &session->tcp_to_ws_cap, &session->tcp_to_ws_len);
-            buf_free(&session->ws_to_tcp_buf, &session->ws_to_tcp_cap, &session->ws_to_tcp_len);
             session->wsi_local_tcp = NULL;
             break;
         default: break;

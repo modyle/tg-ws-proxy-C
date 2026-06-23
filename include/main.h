@@ -9,10 +9,8 @@
 
 #include "../include/mtproto.h"
 
-// Глобальный лимит на буферы пакетов: 3 Мегабайта. 
-// Защищает от пожирания ОЗУ, останавливая загрузку при превышении.
-#define MAX_GLOBAL_PAYLOAD (3 * 1024 * 1024)
-#define SESSION_BUFFER_LIMIT (256 * 1024)
+// Буфер 128 КБ для быстрой прокачки медиафайлов
+#define BUFFER_SIZE (128 * 1024)
 
 typedef struct wss_crypto_context {
     EVP_CIPHER_CTX *encrypt_ctx;
@@ -26,18 +24,17 @@ struct bridge_session {
     struct lws *wsi_local_tcp;
     struct lws *wsi_remote_ws;
     int connection_established;
+    
+    int is_passthrough; // 1 — прямой TCP-пассру туннель, 0 — WebSocket-мост
 
     mtproto_context crypto;
     wss_crypto_context wss_crypto;
 
-    // Динамические буферы, которые растут только при необходимости
-    uint8_t *tcp_to_ws_buf;
+    uint8_t tcp_to_ws_raw[LWS_PRE + BUFFER_SIZE];
     size_t tcp_to_ws_len;
-    size_t tcp_to_ws_cap;
 
-    uint8_t *ws_to_tcp_buf;
+    uint8_t ws_to_tcp_raw[LWS_PRE + BUFFER_SIZE];
     size_t ws_to_tcp_len;
-    size_t ws_to_tcp_cap;
 
     int rx_paused_tcp;
     int rx_paused_ws;
