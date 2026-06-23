@@ -13,10 +13,11 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    # 2. Конфигурируем CMake
-    # Шаг vcpkg install убран. CMake сам запустит vcpkg в режиме манифеста 
-    # и установит openssl и libwebsockets благодаря флагу -DVCPKG_TARGET_TRIPLET
+# 2. Конфигурируем CMake
     - name: Configure CMake
+      shell: pwsh
+      env:
+        VCPKG_ROOT: C:\vcpkg
       run: |
         cmake -B build `
           -DCMAKE_BUILD_TYPE=Release `
